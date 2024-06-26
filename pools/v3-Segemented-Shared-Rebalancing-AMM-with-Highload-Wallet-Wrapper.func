@@ -1,0 +1,214 @@
+;; AMM Pool - Version 3
+;; With high-load wallets across 10 segments, rebalancing every 5 minutes,
+;; and hourly segment management
+
+;; Note: This contract assumes the existence of separate high-load wallet wrapper contracts
+;; for both tokens A and B. These wrappers should be deployed and initialized before
+;; interacting with this AMM pool.
+
+;; Constants
+const int MIN_LIQUIDITY = 1000;  ;; Minimum liquidity to prevent division by zero
+const int REBALANCE_INTERVAL = 300;  ;; 5 minutes in seconds
+const int SEGMENT_MANAGE_INTERVAL = 3600;  ;; 1 hour in seconds
+const int MAX_SEGMENTS = 10;
+const int MIN_SEGMENTS = 2;
+
+;; Storage variables
+global int balance_a;  ;; Total balance of token A
+global int balance_b;  ;; Total balance of token B
+global int total_supply;  ;; Total supply of liquidity tokens
+global int last_rebalance_time;  ;; Timestamp of the last rebalance
+global int last_segment_manage_time;  ;; Timestamp of the last segment management
+global int active_segments;  ;; Number of active segments
+
+global slice token_a_wallet_address;  ;; Address of high-load wallet for token A
+global slice token_b_wallet_address;  ;; Address of high-load wallet for token B
+
+;; Segment structure
+struct Segment {
+    int balance_a;
+    int balance_b;
+    int total_supply;
+}
+
+;; Array of segments
+global Segment[] segments;
+
+;; Initialize the pool
+() init(slice _token_a_wallet_address, slice _token_b_wallet_address) impure {
+    balance_a = 0;
+    balance_b = 0;
+    total_supply = 0;
+    last_rebalance_time = now();
+    last_segment_manage_time = now();
+    active_segments = MIN_SEGMENTS;
+    
+    token_a_wallet_address = _token_a_wallet_address;
+    token_b_wallet_address = _token_b_wallet_address;
+    
+    ;; Initialize segments
+    repeat(MAX_SEGMENTS) {
+        segments~push(Segment{balance_a: 0, balance_b: 0, total_supply: 0});
+    }
+}
+
+;; Internal function to interact with high-load wallet
+() send_to_highload_wallet(slice wallet_address, int amount, slice destination) impure {
+    ;; Create a message to the high-load wallet
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(wallet_address)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(
+            begin_cell()
+                .store_uint(0x7362d09c, 32)  ;; op code for transfer
+                .store_uint(0, 64)  ;; query id
+                .store_coins(amount)
+                .store_slice(destination)
+                .end_cell()
+        )
+        .end_cell();
+    
+    ;; Send the message
+    send_raw_message(msg, 64);  ;; mode 64 means carry all remaining value of the inbound message
+}
+
+;; Add liquidity to a specific segment
+() add_liquidity(int segment_index, int amount_a, int amount_b) impure {
+    require(segment_index < active_segments, "Invalid segment index");
+    Segment segment = segments[segment_index];
+    
+    ;; Transfer tokens from user to this contract via high-load wallets
+    send_to_highload_wallet(token_a_wallet_address, amount_a, my_address());
+    send_to_highload_wallet(token_b_wallet_address, amount_b, my_address());
+    
+    if (segment.total_supply == 0) {
+        segment.balance_a = max(amount_a, MIN_LIQUIDITY);
+        segment.balance_b = max(amount_b, MIN_LIQUIDITY);
+        segment.total_supply = sqrt(segment.balance_a * segment.balance_b);
+    } else {
+        int token_amount = min((amount_a * segment.total_supply) / segment.balance_a,
+                               (amount_b * segment.total_supply) / segment.balance_b);
+        
+        segment.balance_a += amount_a;
+        segment.balance_b += amount_b;
+        segment.total_supply += token_amount;
+    }
+    
+    segments[segment_index] = segment;
+    balance_a += amount_a;
+    balance_b += amount_b;
+    total_supply += segment.total_supply;
+}
+
+;; Remove liquidity from a specific segment
+(int, int) remove_liquidity(int segment_index, int token_amount) impure {
+    require(segment_index < active_segments, "Invalid segment index");
+    Segment segment = segments[segment_index];
+    
+    int amount_a = (token_amount * segment.balance_a) / segment.total_supply;
+    int amount_b = (token_amount * segment.balance_b) / segment.total_supply;
+    
+    ;; Transfer tokens from this contract to user via high-load wallets
+    send_to_highload_wallet(token_a_wallet_address, amount_a, msg.sender);
+    send_to_highload_wallet(token_b_wallet_address, amount_b, msg.sender);
+    
+    segment.balance_a -= amount_a;
+    segment.balance_b -= amount_b;
+    segment.total_supply -= token_amount;
+    
+    segments[segment_index] = segment;
+    balance_a -= amount_a;
+    balance_b -= amount_b;
+    total_supply -= token_amount;
+    
+    return (amount_a, amount_b);
+}
+
+;; Swap tokens within a specific segment
+int swap(int segment_index, int amount_in, int token_in_index) impure {
+    require(segment_index < active_segments, "Invalid segment index");
+    Segment segment = segments[segment_index];
+    
+    int balance_in = token_in_index == 0 ? segment.balance_a : segment.balance_b;
+    int balance_out = token_in_index == 0 ? segment.balance_b : segment.balance_a;
+    
+    int amount_out = (amount_in * balance_out) / (balance_in + amount_in);
+    
+    ;; Transfer tokens using high-load wallets
+    if (token_in_index == 0) {
+        send_to_highload_wallet(token_a_wallet_address, amount_in, my_address());
+        send_to_highload_wallet(token_b_wallet_address, amount_out, msg.sender);
+        segment.balance_a += amount_in;
+        segment.balance_b -= amount_out;
+    } else {
+        send_to_highload_wallet(token_b_wallet_address, amount_in, my_address());
+        send_to_highload_wallet(token_a_wallet_address, amount_out, msg.sender);
+        segment.balance_b += amount_in;
+        segment.balance_a -= amount_out;
+    }
+    
+    segments[segment_index] = segment;
+    return amount_out;
+}
+
+;; Rebalance segments (called every 5 minutes)
+() rebalance_segments() impure {
+    if (now() - last_rebalance_time >= REBALANCE_INTERVAL) {
+        int target_balance_a = balance_a / active_segments;
+        int target_balance_b = balance_b / active_segments;
+        
+        repeat(active_segments) {
+            int i = 0;
+            Segment segment = segments[i];
+            
+            int diff_a = target_balance_a - segment.balance_a;
+            int diff_b = target_balance_b - segment.balance_b;
+            
+            segment.balance_a += diff_a;
+            segment.balance_b += diff_b;
+            
+            segments[i] = segment;
+            i += 1;
+        }
+        
+        last_rebalance_time = now();
+    }
+}
+
+;; Manage segments (called every hour)
+() manage_segments() impure {
+    if (now() - last_segment_manage_time >= SEGMENT_MANAGE_INTERVAL) {
+        int avg_liquidity = total_supply / active_segments;
+        int threshold = avg_liquidity / 2;
+        
+        if (avg_liquidity > threshold * 2 & active_segments < MAX_SEGMENTS) {
+            active_segments += 1;
+        } elseif (avg_liquidity < threshold & active_segments > MIN_SEGMENTS) {
+            active_segments -= 1;
+        }
+        
+        last_segment_manage_time = now();
+    }
+}
+
+;; Tick-tock function
+() tick_tock() impure {
+    rebalance_segments();
+    manage_segments();
+}
+
+;; Helper function to calculate square root
+int sqrt(int x) {
+    if (x == 0) {
+        return 0;
+    }
+    int z = (x + 1) / 2;
+    int y = x;
+    while (z < y) {
+        y = z;
+        z = (x / z + z) / 2;
+    }
+    return y;
+}
