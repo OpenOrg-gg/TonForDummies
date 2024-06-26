@@ -1,0 +1,77 @@
+;; Simple AMM Pool - Version 1
+;; Without batching or high load wallets
+
+;; Constants
+const int MIN_LIQUIDITY = 1000;  ;; Minimum liquidity to prevent division by zero
+
+;; Storage variables
+global int balance_a;  ;; Balance of token A
+global int balance_b;  ;; Balance of token B
+global int total_supply;  ;; Total supply of liquidity tokens
+
+;; Initialize the pool
+() init() impure {
+    balance_a = 0;
+    balance_b = 0;
+    total_supply = 0;
+}
+
+;; Add liquidity to the pool
+() add_liquidity(int amount_a, int amount_b) impure {
+    ;; Check if it's the first liquidity provision
+    if (total_supply == 0) {
+        ;; Initialize the pool with the provided liquidity
+        balance_a = max(amount_a, MIN_LIQUIDITY);
+        balance_b = max(amount_b, MIN_LIQUIDITY);
+        total_supply = sqrt(balance_a * balance_b);
+    } else {
+        ;; Calculate the amount of liquidity tokens to mint
+        int token_amount = min((amount_a * total_supply) / balance_a,
+                               (amount_b * total_supply) / balance_b);
+        
+        ;; Update balances and total supply
+        balance_a += amount_a;
+        balance_b += amount_b;
+        total_supply += token_amount;
+    }
+}
+
+;; Remove liquidity from the pool
+(int, int) remove_liquidity(int token_amount) impure {
+    ;; Calculate the amount of tokens to return
+    int amount_a = (token_amount * balance_a) / total_supply;
+    int amount_b = (token_amount * balance_b) / total_supply;
+    
+    ;; Update balances and total supply
+    balance_a -= amount_a;
+    balance_b -= amount_b;
+    total_supply -= token_amount;
+    
+    return (amount_a, amount_b);
+}
+
+;; Swap tokens
+int swap(int amount_in, int balance_in, int balance_out) impure {
+    ;; Calculate the amount of tokens to receive
+    int amount_out = (amount_in * balance_out) / (balance_in + amount_in);
+    
+    ;; Update balances
+    balance_in += amount_in;
+    balance_out -= amount_out;
+    
+    return amount_out;
+}
+
+;; Helper function to calculate square root
+int sqrt(int x) {
+    if (x == 0) {
+        return 0;
+    }
+    int z = (x + 1) / 2;
+    int y = x;
+    while (z < y) {
+        y = z;
+        z = (x / z + z) / 2;
+    }
+    return y;
+}
