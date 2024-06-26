@@ -1,10 +1,6 @@
-;; AMM Pool - Version 3
-;; With high-load wallets across 10 segments, rebalancing every 5 minutes,
+;; AMM Pool - Version 3 (Updated)
+;; With high-load wallet wrappers across 10 segments, rebalancing every 5 minutes,
 ;; and hourly segment management
-
-;; Note: This contract assumes the existence of separate high-load wallet wrapper contracts
-;; for both tokens A and B. These wrappers should be deployed and initialized before
-;; interacting with this AMM pool.
 
 ;; Constants
 const int MIN_LIQUIDITY = 1000;  ;; Minimum liquidity to prevent division by zero
@@ -12,6 +8,11 @@ const int REBALANCE_INTERVAL = 300;  ;; 5 minutes in seconds
 const int SEGMENT_MANAGE_INTERVAL = 3600;  ;; 1 hour in seconds
 const int MAX_SEGMENTS = 10;
 const int MIN_SEGMENTS = 2;
+
+;; Operation codes
+const int OP_RECEIVE_JETTONS = 0x7362d09c;
+const int OP_INTERNAL_TRANSFER = 0x178d4519;
+const int OP_BURN_AND_RELEASE = 0x595f07bc;
 
 ;; Storage variables
 global int balance_a;  ;; Total balance of token A
@@ -21,8 +22,8 @@ global int last_rebalance_time;  ;; Timestamp of the last rebalance
 global int last_segment_manage_time;  ;; Timestamp of the last segment management
 global int active_segments;  ;; Number of active segments
 
-global slice token_a_wallet_address;  ;; Address of high-load wallet for token A
-global slice token_b_wallet_address;  ;; Address of high-load wallet for token B
+global slice token_a_wrapper_address;  ;; Address of high-load wallet wrapper for token A
+global slice token_b_wrapper_address;  ;; Address of high-load wallet wrapper for token B
 
 ;; Segment structure
 struct Segment {
@@ -35,7 +36,7 @@ struct Segment {
 global Segment[] segments;
 
 ;; Initialize the pool
-() init(slice _token_a_wallet_address, slice _token_b_wallet_address) impure {
+() init(slice _token_a_wrapper_address, slice _token_b_wrapper_address) impure {
     balance_a = 0;
     balance_b = 0;
     total_supply = 0;
@@ -43,8 +44,8 @@ global Segment[] segments;
     last_segment_manage_time = now();
     active_segments = MIN_SEGMENTS;
     
-    token_a_wallet_address = _token_a_wallet_address;
-    token_b_wallet_address = _token_b_wallet_address;
+    token_a_wrapper_address = _token_a_wrapper_address;
+    token_b_wrapper_address = _token_b_wrapper_address;
     
     ;; Initialize segments
     repeat(MAX_SEGMENTS) {
@@ -52,17 +53,16 @@ global Segment[] segments;
     }
 }
 
-;; Internal function to interact with high-load wallet
-() send_to_highload_wallet(slice wallet_address, int amount, slice destination) impure {
-    ;; Create a message to the high-load wallet
+;; Internal function to interact with high-load wallet wrapper
+() interact_with_wrapper(slice wrapper_address, int op, int amount, slice destination) impure {
     cell msg = begin_cell()
         .store_uint(0x18, 6)
-        .store_slice(wallet_address)
+        .store_slice(wrapper_address)
         .store_coins(0)
         .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
         .store_ref(
             begin_cell()
-                .store_uint(0x7362d09c, 32)  ;; op code for transfer
+                .store_uint(op, 32)
                 .store_uint(0, 64)  ;; query id
                 .store_coins(amount)
                 .store_slice(destination)
@@ -70,8 +70,12 @@ global Segment[] segments;
         )
         .end_cell();
     
-    ;; Send the message
     send_raw_message(msg, 64);  ;; mode 64 means carry all remaining value of the inbound message
+}
+
+;; Receive Jettons from user and add to wrapper
+() receive_jettons(slice token_wrapper, int amount) impure {
+    interact_with_wrapper(token_wrapper, OP_RECEIVE_JETTONS, amount, my_address());
 }
 
 ;; Add liquidity to a specific segment
@@ -79,9 +83,9 @@ global Segment[] segments;
     require(segment_index < active_segments, "Invalid segment index");
     Segment segment = segments[segment_index];
     
-    ;; Transfer tokens from user to this contract via high-load wallets
-    send_to_highload_wallet(token_a_wallet_address, amount_a, my_address());
-    send_to_highload_wallet(token_b_wallet_address, amount_b, my_address());
+    ;; Receive Jettons from user and add to wrappers
+    receive_jettons(token_a_wrapper_address, amount_a);
+    receive_jettons(token_b_wrapper_address, amount_b);
     
     if (segment.total_supply == 0) {
         segment.balance_a = max(amount_a, MIN_LIQUIDITY);
@@ -110,9 +114,9 @@ global Segment[] segments;
     int amount_a = (token_amount * segment.balance_a) / segment.total_supply;
     int amount_b = (token_amount * segment.balance_b) / segment.total_supply;
     
-    ;; Transfer tokens from this contract to user via high-load wallets
-    send_to_highload_wallet(token_a_wallet_address, amount_a, msg.sender);
-    send_to_highload_wallet(token_b_wallet_address, amount_b, msg.sender);
+    ;; Burn wrapped Jettons and release original Jettons to user
+    interact_with_wrapper(token_a_wrapper_address, OP_BURN_AND_RELEASE, amount_a, msg.sender);
+    interact_with_wrapper(token_b_wrapper_address, OP_BURN_AND_RELEASE, amount_b, msg.sender);
     
     segment.balance_a -= amount_a;
     segment.balance_b -= amount_b;
@@ -136,15 +140,15 @@ int swap(int segment_index, int amount_in, int token_in_index) impure {
     
     int amount_out = (amount_in * balance_out) / (balance_in + amount_in);
     
-    ;; Transfer tokens using high-load wallets
+    ;; Transfer tokens using high-load wallet wrappers
     if (token_in_index == 0) {
-        send_to_highload_wallet(token_a_wallet_address, amount_in, my_address());
-        send_to_highload_wallet(token_b_wallet_address, amount_out, msg.sender);
+        receive_jettons(token_a_wrapper_address, amount_in);
+        interact_with_wrapper(token_b_wrapper_address, OP_BURN_AND_RELEASE, amount_out, msg.sender);
         segment.balance_a += amount_in;
         segment.balance_b -= amount_out;
     } else {
-        send_to_highload_wallet(token_b_wallet_address, amount_in, my_address());
-        send_to_highload_wallet(token_a_wallet_address, amount_out, msg.sender);
+        receive_jettons(token_b_wrapper_address, amount_in);
+        interact_with_wrapper(token_a_wrapper_address, OP_BURN_AND_RELEASE, amount_out, msg.sender);
         segment.balance_b += amount_in;
         segment.balance_a -= amount_out;
     }
@@ -165,6 +169,18 @@ int swap(int segment_index, int amount_in, int token_in_index) impure {
             
             int diff_a = target_balance_a - segment.balance_a;
             int diff_b = target_balance_b - segment.balance_b;
+            
+            if (diff_a > 0) {
+                interact_with_wrapper(token_a_wrapper_address, OP_INTERNAL_TRANSFER, diff_a, my_address());
+            } else if (diff_a < 0) {
+                interact_with_wrapper(token_a_wrapper_address, OP_INTERNAL_TRANSFER, -diff_a, my_address());
+            }
+            
+            if (diff_b > 0) {
+                interact_with_wrapper(token_b_wrapper_address, OP_INTERNAL_TRANSFER, diff_b, my_address());
+            } else if (diff_b < 0) {
+                interact_with_wrapper(token_b_wrapper_address, OP_INTERNAL_TRANSFER, -diff_b, my_address());
+            }
             
             segment.balance_a += diff_a;
             segment.balance_b += diff_b;
