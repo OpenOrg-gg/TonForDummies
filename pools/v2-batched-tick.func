@@ -1,0 +1,95 @@
+;; AMM Pool - Version 2
+;; With batching settlement every 5 minutes using a tick-tock function
+
+;; Constants
+const int MIN_LIQUIDITY = 1000;  ;; Minimum liquidity to prevent division by zero
+const int BATCH_INTERVAL = 300;  ;; 5 minutes in seconds
+
+;; Storage variables
+global int balance_a;  ;; Balance of token A
+global int balance_b;  ;; Balance of token B
+global int total_supply;  ;; Total supply of liquidity tokens
+global int last_settlement_time;  ;; Timestamp of the last settlement
+
+;; Batch operation queues
+global (int, int)[] add_liquidity_queue;
+global int[] remove_liquidity_queue;
+global (int, int, int)[] swap_queue;
+
+;; Initialize the pool
+() init() impure {
+    balance_a = 0;
+    balance_b = 0;
+    total_supply = 0;
+    last_settlement_time = now();
+}
+
+;; Queue add liquidity operation
+() queue_add_liquidity(int amount_a, int amount_b) impure {
+    add_liquidity_queue~push((amount_a, amount_b));
+}
+
+;; Queue remove liquidity operation
+() queue_remove_liquidity(int token_amount) impure {
+    remove_liquidity_queue~push(token_amount);
+}
+
+;; Queue swap operation
+() queue_swap(int amount_in, int token_in_index, int token_out_index) impure {
+    swap_queue~push((amount_in, token_in_index, token_out_index));
+}
+
+;; Tick-tock function for batch settlement
+() tick_tock() impure {
+    ;; Check if it's time for settlement
+    if (now() - last_settlement_time >= BATCH_INTERVAL) {
+        ;; Process add liquidity queue
+        while (~ add_liquidity_queue.is_empty()) {
+            (int amount_a, int amount_b) = add_liquidity_queue~pop();
+            add_liquidity(amount_a, amount_b);
+        }
+        
+        ;; Process remove liquidity queue
+        while (~ remove_liquidity_queue.is_empty()) {
+            int token_amount = remove_liquidity_queue~pop();
+            remove_liquidity(token_amount);
+        }
+        
+        ;; Process swap queue
+        while (~ swap_queue.is_empty()) {
+            (int amount_in, int token_in_index, int token_out_index) = swap_queue~pop();
+            if (token_in_index == 0 & token_out_index == 1) {
+                swap(amount_in, balance_a, balance_b);
+            } elseif (token_in_index == 1 & token_out_index == 0) {
+                swap(amount_in, balance_b, balance_a);
+            }
+        }
+        
+        ;; Update last settlement time
+        last_settlement_time = now();
+    }
+}
+
+;; Add liquidity to the pool
+() add_liquidity(int amount_a, int amount_b) impure {
+    ;; Implementation remains the same as Version 1
+    ;; ...
+}
+
+;; Remove liquidity from the pool
+(int, int) remove_liquidity(int token_amount) impure {
+    ;; Implementation remains the same as Version 1
+    ;; ...
+}
+
+;; Swap tokens
+int swap(int amount_in, int balance_in, int balance_out) impure {
+    ;; Implementation remains the same as Version 1
+    ;; ...
+}
+
+;; Helper function to calculate square root
+int sqrt(int x) {
+    ;; Implementation remains the same as Version 1
+    ;; ...
+}
