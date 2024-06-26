@@ -1,55 +1,111 @@
-;; High-Load Wallet Wrapper for AMM Pool v3
-;; This contract wraps a standard Jetton and can only be managed by the AMM pool
+;; Complete High-Load Wallet Implementation
 
-;; Constants
+const int MAX_ACTIONS = 254;  ;; Maximum number of actions per message
 const int OP_TRANSFER = 0x0f8a7ea5;
-const int OP_INTERNAL_TRANSFER = 0x178d4519;
 const int OP_BURN = 0x595f07bc;
+const int OP_INTERNAL_TRANSFER = 0x178d4519;
+
+;; Action structure
+struct Action {
+    int op;        ;; Operation type (transfer, burn, internal_transfer)
+    int amount;    ;; Amount of tokens
+    slice to;      ;; Destination address
+    slice from;    ;; Source address (for internal transfers)
+}
 
 ;; Storage variables
-global slice jetton_minter_address;  ;; Address of the original Jetton minter
-global slice pool_address;           ;; Address of the AMM pool that manages this wrapper
-global int total_supply;             ;; Total supply of wrapped Jettons
+global slice jetton_minter_address;
+global slice pool_address;
+global int total_supply;
+global cell action_queue;  ;; Queue of pending actions stored in a cell
 
-;; Initialize the wrapper
+;; Error codes
+const int ERROR_ACCESS_DENIED = 101;
+const int ERROR_INSUFFICIENT_BALANCE = 102;
+const int ERROR_INVALID_ACTION = 103;
+
+;; Initialize the wallet
 () init(slice _jetton_minter_address, slice _pool_address) impure {
     jetton_minter_address = _jetton_minter_address;
     pool_address = _pool_address;
     total_supply = 0;
+    action_queue = begin_cell().end_cell();
 }
 
-;; Receive Jettons from users and mint wrapped Jettons
-() receive_jettons(int amount, slice sender_address) impure {
-    ;; Only the pool can call this function
-    require(equal_slices(sender_address, pool_address), "Only the pool can receive Jettons");
+;; Queue an action
+() queue_action(int op, int amount, slice to, slice from) impure {
+    require(equal_slices(msg.sender, pool_address), ERROR_ACCESS_DENIED);
     
-    ;; Mint wrapped Jettons
-    total_supply += amount;
+    ;; Load current queue
+    slice cs = action_queue.begin_parse();
+    cell new_queue = begin_cell();
     
-    ;; Here we would typically send a notification to the user, but since this is internal,
-    ;; we'll just log the minting
-    ;; For real implementation, consider adding appropriate logging or notification mechanism
+    ;; Copy existing actions
+    while (cs.slice_refs()) {
+        new_queue = new_queue.store_ref(cs~load_ref());
+    }
+    
+    ;; Add new action
+    new_queue = new_queue.store_ref(
+        begin_cell()
+            .store_uint(op, 32)
+            .store_coins(amount)
+            .store_slice(to)
+            .store_slice(from)
+        .end_cell()
+    );
+    
+    action_queue = new_queue.end_cell();
 }
 
-;; Transfer wrapped Jettons internally (between pool segments)
-() internal_transfer(int amount, slice from_address, slice to_address) impure {
-    ;; Only the pool can call this function
-    require(equal_slices(msg.sender, pool_address), "Only the pool can transfer internally");
+;; Process queued actions
+() process_actions() impure {
+    require(equal_slices(msg.sender, pool_address), ERROR_ACCESS_DENIED);
     
-    ;; No need to update total_supply as it's just an internal transfer
-    ;; For real implementation, consider adding appropriate logging or notification mechanism
+    int processed = 0;
+    cell new_queue = begin_cell();
+    slice cs = action_queue.begin_parse();
+    
+    while (cs.slice_refs() & (processed < MAX_ACTIONS)) {
+        cell action_cell = cs~load_ref();
+        slice action_cs = action_cell.begin_parse();
+        
+        int op = action_cs~load_uint(32);
+        int amount = action_cs~load_coins();
+        slice to = action_cs~load_msg_addr();
+        slice from = action_cs~load_msg_addr();
+        
+        if (op == OP_TRANSFER) {
+            ;; Implement transfer logic
+            require(total_supply >= amount, ERROR_INSUFFICIENT_BALANCE);
+            send_tokens(to, amount);
+            total_supply -= amount;
+        } elseif (op == OP_BURN) {
+            ;; Implement burn logic
+            require(total_supply >= amount, ERROR_INSUFFICIENT_BALANCE);
+            burn_tokens(to, amount);
+            total_supply -= amount;
+        } elseif (op == OP_INTERNAL_TRANSFER) {
+            ;; Implement internal transfer logic
+            ;; No need to update total_supply for internal transfers
+            ;; This is just a bookkeeping operation within the pool
+        } else {
+            throw(ERROR_INVALID_ACTION);
+        }
+        
+        processed += 1;
+    }
+    
+    ;; Store remaining actions back into the queue
+    while (cs.slice_refs()) {
+        new_queue = new_queue.store_ref(cs~load_ref());
+    }
+    
+    action_queue = new_queue.end_cell();
 }
 
-;; Burn wrapped Jettons and release original Jettons
-() burn_and_release(int amount, slice to_address) impure {
-    ;; Only the pool can call this function
-    require(equal_slices(msg.sender, pool_address), "Only the pool can burn and release");
-    
-    ;; Burn wrapped Jettons
-    require(total_supply >= amount, "Insufficient wrapped Jettons");
-    total_supply -= amount;
-    
-    ;; Release original Jettons
+;; Send tokens (helper function for transfers)
+() send_tokens(slice to, int amount) impure {
     var msg = begin_cell()
         .store_uint(0x18, 6)
         .store_slice(jetton_minter_address)
@@ -60,19 +116,51 @@ global int total_supply;             ;; Total supply of wrapped Jettons
                 .store_uint(OP_TRANSFER, 32)
                 .store_uint(0, 64)  ;; query_id
                 .store_coins(amount)
-                .store_slice(to_address)
+                .store_slice(to)
                 .store_slice(pool_address)  ;; response_address
                 .store_uint(0, 1)  ;; no custom payload
                 .store_coins(1)  ;; forward_amount
                 .store_uint(0, 1)  ;; no forward_payload
-                .end_cell()
+            .end_cell()
         )
-        .end_cell();
+    .end_cell();
     
     send_raw_message(msg, 64);  ;; mode 64: carry all remaining value of the inbound message
 }
 
+;; Burn tokens (helper function for burns)
+() burn_tokens(slice to, int amount) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(jetton_minter_address)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(
+            begin_cell()
+                .store_uint(OP_BURN, 32)
+                .store_uint(0, 64)  ;; query_id
+                .store_coins(amount)
+                .store_slice(to)
+            .end_cell()
+        )
+    .end_cell();
+    
+    send_raw_message(msg, 64);
+}
+
+;; Receive Jettons and mint wrapped Jettons
+() receive_jettons(int amount, slice sender_address) impure {
+    require(equal_slices(sender_address, pool_address), ERROR_ACCESS_DENIED);
+    total_supply += amount;
+}
+
 ;; Get wallet data
-(int, slice, slice) get_wallet_data() method_id {
-    return (total_supply, jetton_minter_address, pool_address);
+(int, slice, slice, int) get_wallet_data() method_id {
+    int queue_length = 0;
+    slice cs = action_queue.begin_parse();
+    while (cs.slice_refs()) {
+        cs~load_ref();
+        queue_length += 1;
+    }
+    return (total_supply, jetton_minter_address, pool_address, queue_length);
 }
